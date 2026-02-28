@@ -1,0 +1,272 @@
+---
+title: "Great Lakes Ice Cover Report"
+author: "Charntel and Sam"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: cosmo
+    toc: yes
+---
+
+```{r set-up, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r libraries}
+library(tidyverse)
+```
+
+```{r data}
+coverage <- read.csv("greatlakesicedata.csv") |>
+  column_to_rownames(var = "X") # Turn days into row labels
+
+# Remove leading X in variable names
+names(coverage) <- sub("^X", "", names(coverage))
+```
+
+# Introduction
+
+For the past 50 years, the United States National Oceanic and Atmospheric Administration (NOAA) has collected daily satellite-based measurements of ice coverage across the Great Lakes. This publicly available dataset is an invaluable resource for climate scientists studying long-term changes in winter severity in the Midwest and their effects on local ecosystems and shipping routes.
+
+To make full use of these data for examining long-term trends in ice coverage, we must first develop a consistent annual metric and then assess how that metric has changed over time. This project aims to accomplish both objectives.
+
+# Methods
+
+## Data
+
+The NOAA dataset reports the percentage of total ice coverage across the five Great Lakes for each day from November 10 to June 5. Because ice typically has not yet formed early in the season and has fully thawed by late spring, many observations near the start and end of each season are missing. In most years, measurements begin once ice coverage reaches roughly 1–3%, but in some cases coverage does not appear until 5–15%. By contrast, end-of-season data are generally complete, as melt-out dates are well observed.
+
+These missing values are *not* missing at random: earlier years tend to have more missing early-season data. This temporal pattern needs to be addressed before constructing an annual metric. After evaluating several possible metrics of annual ice severity, we chose to use the sum of daily ice coverage over a season, effectively measuring the “area under the curve.” Because this metric integrates across the full season, we do not need to impute day-level data precisely; instead, we only need to estimate the *total contribution* of the missing early-season portion for years where missingness is substantial. We defined substantial missingness as cases where the first or last observed value exceeded 5%. For those years, we estimated the missing contribution by computing the average early-season sum from years with complete early data (i.e., those with first or last observations ≤5%) up to the point where the truncated year reaches its first observed coverage.
+
+This approach does not reconstruct the exact shape of early-season ice formation for truncated years, but it does adjust their annual totals to be consistent with the average behavior observed in years with complete records.
+
+One additional data irregularity is that February 29 (Leap Day) is absent in three out of four years. This discrepancy does not affect the annual coverage metric, as it reflects a calendar misalignment rather than a true missing observation.
+
+```{r}
+# Find the first non-missing entry in each column
+first_nonmissing <- sapply(coverage, function(x) x[which(!is.na(x))[1]])
+
+# Split into two data frames
+truncated_data <- coverage[ , first_nonmissing >= 5, drop = FALSE]
+complete_data <- coverage[ , first_nonmissing < 5, drop = FALSE]
+
+# Starting coverage value for truncated data
+starts <- sapply(truncated_data, function(x) x[which(!is.na(x))[1]])
+
+# List to store imputed sums in
+results <- numeric(length(starts))
+names(results) <- names(starts)
+
+for (i in seq_along(starts)) {
+  start_val <- starts[i]
+  
+  col_sums <- sapply(complete_data, function(col) {
+    # Find where the entry exceeds the starting value
+    idx <- which(col > start_val)[1]
+    
+    # Find where non-missing values start
+    idx_start <- which(!is.na(col))[1]
+    if (is.na(idx_start)) return(NA_real_)  # if column all NA
+    
+    # Handle different scenarios safely
+    if (is.na(idx)) {
+      # Nothing exceeds start_val → sum everything after leading NAs
+      return(sum(col[idx_start:length(col)], na.rm = TRUE))
+    } else if (idx <= idx_start) {
+      # The first nonmissing entry already exceeds start_val
+      return(0)
+    } else {
+      # Normal case: sum up to (but not including) the first exceeding value
+      return(sum(col[idx_start:(idx - 1)], na.rm = TRUE))
+    }
+  })
+  
+  results[i] <- mean(col_sums, na.rm = TRUE)
+}
+```
+
+## Statistical Analysis
+
+We initially expected that this dataset would require a time-series approach, given its annual structure. However, after examining the autocorrelation function, we found no meaningful dependence between consecutive years. In other words, ice coverage in one year appears to have little influence on coverage in the next. Combined with the approximately linear long-term trend in the data, this justified the use of a standard linear regression model, with year as the independent variable and total annual ice coverage as the dependent variable.
+
+## Software
+
+All analysis performed in R 4.5.1 using base R packages as well as *tidyverse* (full citations in the appendix).
+
+# Results
+
+## EDA
+
+```{r}
+# Calculate annual sums and add imputed sums 
+sum_data <- sapply(coverage, function(col) {sum(col, na.rm = TRUE)})
+sum_data_complete <- sum_data
+for (n in names(results)) {
+  sum_data_complete[[n]] <- sum_data[[n]] + results[[n]]
+}
+df <- data.frame(
+  Year = as.numeric(names(sum_data_complete)),
+  sums_complete = unlist(sum_data_complete),
+  sums = unlist(sum_data),
+  row.names = NULL
+)
+```
+
+```{r}
+# Create the cool-toned palette (same as earlier)
+cool_palette <- colorRampPalette(c(
+  "#08306B", "#2171B5", "#6BAED6", "#C7E9F1", "#EDF8FB"
+))
+
+# Generate many colors for smooth gradients
+cool_colors <- cool_palette(200)
+
+# Invert the palette
+cool_colors_inverted <- rev(cool_colors)
+
+# Convert coverage to long format
+coverage_long <- coverage %>%
+  mutate(Day = 1:n()) %>%
+  pivot_longer(
+    cols = -Day,
+    names_to = "Year",
+    values_to = "Value"
+  )
+
+coverage_long$Year <- as.numeric(coverage_long$Year)
+
+# Plot
+ggplot(coverage_long, aes(x = Year, y = Day, fill = Value)) +
+  geom_tile() +
+
+  # Custom inverted palette + white for NA
+  scale_fill_gradientn(
+    colours = cool_colors_inverted,
+    na.value = "#EDF8FB",
+    name = "Ice Coverage"
+  ) +
+
+  scale_y_reverse() +
+  labs(
+    title = "Coverage Heatmap",
+    subtitle = "Daily ice coverage percentage for the Great Lakes over time",
+    x = "Year",
+    y = "Day of Year",
+    caption = "Leap Day missing data for 3 out of every 4 years."
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 50, 100, 150, 200),
+    labels = c("Nov. 10", "Dec. 29", "Feb. 17", "Apr. 7", "May 27")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+```
+
+Our preliminary data exploration suggested a systemic decrease in ice coverage over time. Additionally, the variation from year to year seemed to be within reason with the exception of a few particularly warm years (e.g. 1983, 1987, 1998) and a few particularly cold years in (e.g. 1994, 2003, 2014).
+
+## Autocorrelation Analysis
+
+The ACF was calculated on the annual sum of ice coverage because this is the primary response variable used to assess long-term change in ice severity across years. Checking for autocorrelation in this aggregated metric determines whether linear regression is appropriate for inference.
+
+```{r}
+# Creating analysis dataset for regression and diagnostics
+ice_yearly <- df |>
+  select(Year, sums_complete) |>
+  rename(AnnualSum = sums_complete) |>
+  arrange(Year)
+
+# ACF of the annual ice coverage series
+acf(df$sums_complete, main = "ACF of Annual Ice Coverage Sums")
+```
+
+The autocorrelation function (ACF) plot for the annual summed ice coverage shows that all autocorrelation estimates beyond lag 0 fall well within reasonable levels ($|r| \leq 0.3$). This indicates that there is no statistically meaningful correlation between one year’s total ice coverage and the coverage observed in the following years. Thus years with high or low ice coverage do not systematically lead to similar conditions in subsequent years.
+
+Since there's weak evidence of time dependence, it's reasonable to treat the data as roughly independent across years. That makes a standard linear regression model a suitable choice for assessing long-term trends in Great Lakes ice cover, without needing more complex time-series methods like ARIMA or models with lagged errors.
+
+## Fitting the regression model for annual ice coverage
+
+```{r}
+ggplot(df, aes(x = Year, y = sums_complete)) +
+  geom_line(color = "#2171B5", linewidth = 1) +
+  geom_point(color = "#2171B5", size = 3) +
+  geom_point(aes(x = Year, y = sums), color = "#C7E9F1", size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue", linetype = "dashed") +
+  labs(
+    title = "Summed Annual Ice Coverage on the Great Lakes",
+    subtitle = "Light blue dots represent data without imputation",
+    x = "Year",
+    y = "Sum of Ice Coverage"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+To quantify long-term changes in winter ice severity across the Great Lakes, we fit a linear regression model using year as a predictor of annual summed ice coverage. This approach allows us to assess whether there is a statistically significant linear trend over time, consistent with regional warming.
+
+```{r}
+fit_lm <- lm(AnnualSum ~ Year, data = ice_yearly)
+#summary(fit_lm)
+```
+
+We estimated the slope to be −43.75 (p \< 0.05) units per year indicating that the total seasonal ice coverage has been decreasing on average by approximately 44 coverage units each year, this adds up to roughly 440 fewer units per decade, which is a substantial loss. The model has an $R^2$ of 0.14, thus 14% of the total variation in annual ice is explained by the model. Given individual winter severity is also influenced by short-term climate patterns, this is an expected level of variance explained. Overall, this regression analysis provides strong evidence that winter ice cover across the Great Lakes has declined significantly over the last several decades, consistent with warming climate trends in the region.
+
+We evaluated all key regression assumptions, including linearity, normality of residuals, homoscedasticity, independence over time, and influence of outliers. The diagnostics did not reveal any major concerns, indicating that the linear regression model is appropriate for this analysis. Detailed diagnostic plots and results are provided in the Appendix.
+
+# Conclusion
+
+Based on data from NOAA, we found a statistically significant systemic downward trend in the ice coverage of the Great Lakes over time. This finding indirectly implies a warming climate in the Mid-West region of the United States. This is consistent with observed global trends, and raises serious concerns for the ecology of the region.
+
+# Appendix
+
+## Regression Diagnostics check
+
+To ensure that our regression model provides valid and reliable inference, we evaluate its key assumptions using standard diagnostic plots. In this section, we assess linearity, normality of residuals, homoscedasticity (constant variance), independence over time, and the presence of any influential outliers.
+
+```{r}
+# Diagnostic plots for regression assumptions
+par(mfrow = c(2,2))
+plot(fit_lm)
+par(mfrow = c(1,1))
+
+# Residual autocorrelation check
+acf(residuals(fit_lm),
+    main = "Autocorrelation of Regression Residuals")
+```
+
+The diagnostics do not indicate any major violations of the linear regression assumptions and our results were as below:
+
+-   **Linearity:**The Residuals vs. Fitted plot does not show a pattern. The residuals are scattered fairly evenly around zero, thus it is indicating that a linear model is appropriate for describing the long-term trend in annual ice coverage.
+
+-   **Normality of Residuals:**The Q-Q plot shows mild deviation in the upper tail, but most points lie very close to the line. Thus the normality assumption is satisfied
+
+-   **Constant Variance (Homoscedasticity):** The Scale-Location plot shows a fairly constant spread of residuals across fitted values, with no clear pattern. This indicates that variability in ice coverage does not systematically increase or decrease over time.
+
+-   **Influential Observations:** The Residuals vs. Leverage plot does not show any points near the Cook’s distance cutoff. A few recent years have higher leverage but do not appear to unduly influence the model.
+
+-   **Independence of Residuals:**The ACF of regression residuals shows all autocorrelation values within the dashed significance bounds, indicating no meaningful temporal dependence across years.
+
+Overall, these diagnostics provide strong support that the assumptions underlying linear regression are adequately met. Therefore, the estimates and hypothesis tests from the regression model can be reliably used to assess long-term changes in Great Lakes ice cover.
+
+## References
+
+-   Canvas - Created by Mr. Hughes
+
+    -   "Great Lakes Ice Cover - Description and Preliminary Analysis"
+
+    -   "Project 5: Issues and Resources:
+
+-   Great Lakes Environmental Research Laboratory (GLERL) website: <https://www.glerl.noaa.gov/data/ice/>
+
+## R Package Citations
+
+```{r}
+citation("tidyverse")
+```
